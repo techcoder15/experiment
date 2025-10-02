@@ -30,12 +30,14 @@ ANOMALY_THRESHOLD = 0.05  # Fraction of points flagged as anomalies to suggest p
 def clean_lightcurve(lc):
     """Clean light curve using preferred flux columns without deprecation."""
     # Prefer pdcsap_flux if available, else sap_flux
-    if 'pdcsap_flux' in lc.columns and lc['pdcsap_flux'] is not None:
+    if 'pdcsap_flux' in lc.columns:
         flux_col = lc['pdcsap_flux']
+        flux_err_col = lc['pdcsap_flux_err'] if 'pdcsap_flux_err' in lc.columns else None
     else:
         flux_col = lc['sap_flux']
-    # Create new LC with selected flux to avoid deprecation
-    lc = lc.with_flux(flux_col)
+        flux_err_col = lc['sap_flux_err'] if 'sap_flux_err' in lc.columns else None
+    # Select the flux column
+    lc = lc.select_flux(flux_col, flux_err_col)
     return lc.remove_nans().remove_outliers()
 
 def compute_flux_stats(flux):
