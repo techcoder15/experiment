@@ -1,0 +1,54 @@
+/* Space-themed color palette */
+:root {
+    --bg-dark: #0a0a2a; /* Deep blue */
+    --accent-purple: #4b0082;
+    --accent-cyan: #00ffff;
+    --text-white: #ffffff;
+}
+
+/* Apply to Streamlit elements */
+body {
+    background-color: var(--bg-dark);
+    color: var(--text-white);
+    font-family: 'Roboto', sans-serif; /* Modern typography */
+}
+
+/* Headings and text for readability on dark bg */
+h1, h2, h3, h4, h5, h6 {
+    color: var(--accent-cyan);
+}
+
+p, div, span {
+    color: var(--text-white);
+}
+
+/* Buttons and selects */
+.stButton > button {
+    background-color: var(--accent-purple);
+    color: var(--text-white);
+    border: 1px solid var(--accent-cyan);
+}
+
+.stSelectbox > div {
+    background-color: var(--bg-dark);
+    color: var(--text-white);
+}
+
+/* Smooth transitions */
+* {
+    transition: all 0.3s ease-in-out;
+}
+
+/* Status bar styling */
+.stAlert {
+    background-color: var(--accent-purple);
+    color: var(--text-white);
+}
+
+/* Dashboard cards (for streamlit-elements) */
+.MuiPaper-root {
+    background-color: rgba(10, 10, 42, 0.8) !important;
+    color: var(--text-white) !important;
+    border: 1px solid var(--accent-cyan);
+    box-shadow: 0 0 10px var(--accent-cyan);
+}
