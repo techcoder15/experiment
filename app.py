@@ -85,6 +85,11 @@ def clean_tic_id(tic_id):
         raise ValueError(f"Invalid TIC ID: {tic_id}")
     return tic_clean
 
+def get_full_tic(tic_id):
+    """Get full TIC string for lightkurve search."""
+    tic_num = clean_tic_id(tic_id)
+    return f"TIC {tic_num}"
+
 def has_confirmed_exoplanet(tic_id):
     """Query NASA Exoplanet Archive to check if the TIC ID hosts a confirmed exoplanet."""
     try:
@@ -107,13 +112,14 @@ def has_confirmed_exoplanet(tic_id):
 def run_analysis(tic_id):
     """Run the full analysis for a single TIC ID and return results and figures."""
     try:
+        full_tic = get_full_tic(tic_id)
         tic_clean = clean_tic_id(tic_id)
         
         # Check for confirmed exoplanet first
         is_exoplanet_host = has_confirmed_exoplanet(tic_id)
         
         # Data Fetch and Cleaning
-        sector_data = search_lightcurve(tic_clean)
+        sector_data = search_lightcurve(full_tic)
         if len(sector_data) == 0:
             return None, "No data found for TIC ID.", {}
         lc = sector_data[1].download()
@@ -278,16 +284,16 @@ elif input_mode == "Upload CSV":
         for raw_id in raw_ids:
             try:
                 cleaned = clean_tic_id(raw_id)
-                tic_ids.append(cleaned)
+                tic_ids.append(f"TIC {cleaned}")  # Store as full for analysis
             except ValueError:
                 st.warning(f"Skipping invalid TIC ID: {raw_id}")
         st.sidebar.write(f"Loaded {len(tic_ids)} valid TIC IDs from {len(raw_ids)} entries.")
         
         if st.sidebar.button("Analyze All"):
-            for i, tic_id in enumerate(tic_ids):
-                with st.expander(f"TIC {tic_id} ({i+1}/{len(tic_ids)})", expanded=False):
-                    with st.spinner(f"Analyzing TIC {tic_id} with AI/ML..."):
-                        results, classification, figs = run_analysis(f"TIC {tic_id}")  # Pass with prefix for display
+            for i, full_tic in enumerate(tic_ids):
+                with st.expander(f"{full_tic} ({i+1}/{len(tic_ids)})", expanded=False):
+                    with st.spinner(f"Analyzing {full_tic} with AI/ML..."):
+                        results, classification, figs = run_analysis(full_tic)
                         if results:
                             col1, col2 = st.columns(2)
                             with col1:
