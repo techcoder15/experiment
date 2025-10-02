@@ -28,10 +28,14 @@ ANOMALY_THRESHOLD = 0.05  # Fraction of points flagged as anomalies to suggest p
 # --------------------------------------
 
 def clean_lightcurve(lc):
-    if hasattr(lc, 'PDCSAP_FLUX') and lc.PDCSAP_FLUX is not None:
-        lc = lc.PDCSAP_FLUX
+    """Clean light curve using preferred flux columns without deprecation."""
+    # Prefer pdcsap_flux if available, else sap_flux
+    if 'pdcsap_flux' in lc.columns and lc['pdcsap_flux'] is not None:
+        flux_col = lc['pdcsap_flux']
     else:
-        lc = lc.SAP_FLUX
+        flux_col = lc['sap_flux']
+    # Create new LC with selected flux to avoid deprecation
+    lc = lc.with_flux(flux_col)
     return lc.remove_nans().remove_outliers()
 
 def compute_flux_stats(flux):
@@ -59,11 +63,13 @@ def detect_transit_candidates(flux, bls_folded, anomaly_threshold=ANOMALY_THRESH
         num_anomalies = np.sum(anomalies == -1)
         anomaly_fraction = num_anomalies / len(flux)
         
-        # Check if anomalies cluster in the folded phase (simple check for dips below median)
-        folded_flux = bls_folded.flux.value
-        folded_norm = (folded_flux - np.mean(folded_flux)) / np.std(folded_flux)
-        folded_anomalies = iso_forest.predict(folded_norm.reshape(-1, 1))
-        clustered_anomalies = np.sum(folded_anomalies == -1) / len(folded_flux)
+        # Check folded if provided
+        clustered_anomalies = 0.0
+        if bls_folded is not None:
+            folded_flux = bls_folded.flux.value
+            folded_norm = (folded_flux - np.mean(folded_flux)) / np.std(folded_flux)
+            folded_anomalies = iso_forest.fit_predict(folded_norm.reshape(-1, 1))  # Refit for folded
+            clustered_anomalies = np.sum(folded_anomalies == -1) / len(folded_flux)
         
         is_transit_candidate = (anomaly_fraction > anomaly_threshold) and (clustered_anomalies > anomaly_threshold)
         
@@ -72,14 +78,17 @@ def detect_transit_candidates(flux, bls_folded, anomaly_threshold=ANOMALY_THRESH
         st.warning(f"ML anomaly detection failed: {str(e)}")
         return False, 0.0, 0
 
+def clean_tic_id(tic_id):
+    """Clean TIC ID: remove 'TIC ' prefix, strip, and validate."""
+    tic_clean = str(tic_id).replace('TIC ', '').replace('TIC', '').strip()
+    if not tic_clean.isdigit():
+        raise ValueError(f"Invalid TIC ID: {tic_id}")
+    return tic_clean
+
 def has_confirmed_exoplanet(tic_id):
     """Query NASA Exoplanet Archive to check if the TIC ID hosts a confirmed exoplanet."""
     try:
-        # Clean TIC ID: remove 'TIC ' prefix and ensure it's a string/int
-        tic_clean = str(tic_id).replace('TIC ', '').replace('TIC', '').strip()
-        if not tic_clean.isdigit():
-            return False
-        
+        tic_clean = clean_tic_id(tic_id)
         query = f"select count(*) as n from ps where tic_id = '{tic_clean}'"
         encoded_query = urllib.parse.quote(query)
         url = f"https://exoplanetarchive.ipac.caltech.edu/TAP/sync?query={encoded_query}&format=json"
@@ -98,11 +107,13 @@ def has_confirmed_exoplanet(tic_id):
 def run_analysis(tic_id):
     """Run the full analysis for a single TIC ID and return results and figures."""
     try:
+        tic_clean = clean_tic_id(tic_id)
+        
         # Check for confirmed exoplanet first
         is_exoplanet_host = has_confirmed_exoplanet(tic_id)
         
         # Data Fetch and Cleaning
-        sector_data = search_lightcurve(tic_id)
+        sector_data = search_lightcurve(tic_clean)
         if len(sector_data) == 0:
             return None, "No data found for TIC ID.", {}
         lc = sector_data[1].download()
@@ -111,9 +122,6 @@ def run_analysis(tic_id):
         flux = lc_clean.flux.value
         amp, rms, flux_mean, flux_std = compute_flux_stats(flux)
         rel_std = flux_std / flux_mean
-
-        # ML Anomaly Detection for Transit Candidates
-        is_transit_candidate, anomaly_fraction, num_anomalies = detect_transit_candidates(flux, None)  # bls_folded not yet available
 
         # Lomb-Scargle Analysis
         lk_periodogram = lc_clean.to_periodogram(method="lombscargle", minimum_period=MIN_PERIOD, maximum_period=MAX_PERIOD)
@@ -133,12 +141,12 @@ def run_analysis(tic_id):
         bls_max_power = np.max(bls_result.power)
         bls_variable = classify_variable(bls_max_power, BLS_POWER_THRESHOLD, amp, rms, rel_std)
 
-        # Re-run anomaly detection with folded LC for better clustering check
-        bls_folded = lc_clean.fold(period=bls_best_period)
-        is_transit_candidate, anomaly_fraction, num_anomalies = detect_transit_candidates(flux, bls_folded)
-
         # Folded Light Curves
         ls_folded = lc_clean.fold(period=ls_best_period)
+        bls_folded = lc_clean.fold(period=bls_best_period)
+
+        # ML Anomaly Detection for Transit Candidates (after BLS)
+        is_transit_candidate, anomaly_fraction, num_anomalies = detect_transit_candidates(flux, bls_folded)
 
         # Create figures
         figs = {}
@@ -146,11 +154,11 @@ def run_analysis(tic_id):
         # Cleaned LC with anomalies highlighted (ML viz)
         fig_lc, ax_lc = plt.subplots()
         lc_clean.plot(ax=ax_lc, title="Cleaned Light Curve with ML Anomalies")
-        if num_anomalies > 0:
-            anomaly_mask = iso_forest.predict((flux - flux_mean) / flux_std).reshape(-1) == -1  # Reuse from function if possible, but recreate for plot
-            iso_forest_plot = IsolationForest(contamination=0.1, random_state=42)
-            flux_norm_plot = ((flux - flux_mean) / flux_std).reshape(-1, 1)
-            anomalies_plot = iso_forest_plot.fit_predict(flux_norm_plot) == -1
+        # Refit for plotting
+        flux_norm_plot = ((flux - flux_mean) / flux_std).reshape(-1, 1)
+        iso_forest_plot = IsolationForest(contamination=0.1, random_state=42)
+        anomalies_plot = iso_forest_plot.fit_predict(flux_norm_plot) == -1
+        if np.sum(anomalies_plot) > 0:
             ax_lc.scatter(time[anomalies_plot], flux[anomalies_plot], color='red', s=1, alpha=0.5, label='ML Anomalies')
             ax_lc.legend()
         figs['lc'] = fig_lc
@@ -184,8 +192,9 @@ def run_analysis(tic_id):
         folded_flux_norm = ((bls_folded.flux.value - np.mean(bls_folded.flux.value)) / np.std(bls_folded.flux.value)).reshape(-1, 1)
         iso_forest_fold = IsolationForest(contamination=0.1, random_state=42)
         folded_anoms = iso_forest_fold.fit_predict(folded_flux_norm) == -1
-        ax_bls_fold.scatter(bls_folded.phase[folded_anoms], bls_folded.flux.value[folded_anoms], color='red', s=5, alpha=0.7, label='ML Anomalies')
-        ax_bls_fold.legend()
+        if np.sum(folded_anoms) > 0:
+            ax_bls_fold.scatter(bls_folded.phase[folded_anoms], bls_folded.flux.value[folded_anoms], color='red', s=5, alpha=0.7, label='ML Anomalies')
+            ax_bls_fold.legend()
         figs['bls_fold'] = fig_bls_fold
 
         # Results dict
@@ -223,6 +232,8 @@ def run_analysis(tic_id):
             classification = "❌ No strong variability detected"
         
         return results, classification, figs
+    except ValueError as ve:
+        return None, str(ve), {}
     except Exception as e:
         return None, f"Error: {str(e)}", {}
 
@@ -236,59 +247,4 @@ st.sidebar.header("Input Options")
 input_mode = st.sidebar.radio("Choose input method:", ("Single TIC ID", "Upload CSV"))
 
 if input_mode == "Single TIC ID":
-    tic_id = st.sidebar.text_input("Enter TIC ID (e.g., TIC 168789840):", value="TIC 168789840")
-    if st.sidebar.button("Analyze"):
-        if tic_id:
-            with st.spinner("Analyzing with AI/ML..."):
-                results, classification, figs = run_analysis(tic_id)
-                if results:
-                    st.header(f"Results for {tic_id}")
-                    st.subheader("Key Metrics")
-                    for key, value in results.items():
-                        st.write(f"**{key}:** {value}")
-                    st.subheader("Classification")
-                    st.write(classification)
-                    
-                    st.subheader("Plots")
-                    for key, fig in figs.items():
-                        st.pyplot(fig)
-                        plt.close(fig)  # Close to free memory
-                else:
-                    st.error(classification)
-        else:
-            st.warning("Please enter a TIC ID.")
-
-elif input_mode == "Upload CSV":
-    uploaded_file = st.sidebar.file_uploader("Upload CSV with TIC IDs (one per row, no header):", type="csv")
-    if uploaded_file is not None:
-        df = pd.read_csv(uploaded_file, header=None)
-        tic_ids = df[0].tolist()  # Assuming first column is TIC IDs
-        st.sidebar.write(f"Loaded {len(tic_ids)} TIC IDs.")
-        
-        if st.sidebar.button("Analyze All"):
-            for i, tic_id in enumerate(tic_ids):
-                with st.expander(f"TIC ID: {tic_id} ({i+1}/{len(tic_ids)})", expanded=False):
-                    with st.spinner(f"Analyzing {tic_id} with AI/ML..."):
-                        results, classification, figs = run_analysis(tic_id)
-                        if results:
-                            col1, col2 = st.columns(2)
-                            with col1:
-                                st.subheader("Key Metrics")
-                                for key, value in results.items():
-                                    st.write(f"**{key}:** {value}")
-                            with col2:
-                                st.subheader("Classification")
-                                st.write(classification)
-                            
-                            st.subheader("Plots")
-                            for key, fig in figs.items():
-                                st.pyplot(fig)
-                                plt.close(fig)
-                        else:
-                            st.error(classification)
-    else:
-        st.info("Upload a CSV file with TIC IDs to get started.")
-
-# Example note
-st.sidebar.markdown("---")
-st.sidebar.info("**Example Confirmed Exoplanet Host:** Try TIC 261136679 (Pi Mensae, host of TESS-discovered planet Pi Men c)\n\n**ML Feature:** Isolation Forest detects anomalous flux dips as potential transits.")
+    tic_id = st.sidebar.text_input("Enter TIC ID (e.g.,
