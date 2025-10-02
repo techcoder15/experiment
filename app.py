@@ -1,11 +1,13 @@
 import streamlit as st
 import pandas as pd
+import requests
 from lightkurve import search_lightcurve
 from astropy.timeseries import LombScargle, BoxLeastSquares
 import numpy as np
 import matplotlib.pyplot as plt
 from io import BytesIO
 import base64
+import urllib.parse  # For quoting the query
 
 # --------------------------------------
 # CONFIGURATION (same as core)
@@ -41,13 +43,39 @@ def classify_variable(power, threshold, amp, rms, rel_std):
     return (power > threshold and amp > AMP_THRESHOLD and
             rms > RMS_THRESHOLD and rel_std > REL_STD_THRESHOLD)
 
+def has_confirmed_exoplanet(tic_id):
+    """Query NASA Exoplanet Archive to check if the TIC ID hosts a confirmed exoplanet."""
+    try:
+        # Clean TIC ID: remove 'TIC ' prefix and ensure it's a string/int
+        tic_clean = str(tic_id).replace('TIC ', '').replace('TIC', '').strip()
+        if not tic_clean.isdigit():
+            return False
+        
+        query = f"select count(*) as n from ps where tic_id = '{tic_clean}'"
+        encoded_query = urllib.parse.quote(query)
+        url = f"https://exoplanetarchive.ipac.caltech.edu/TAP/sync?query={encoded_query}&format=json"
+        
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            if 'result' in data and 'table' in data['result'] and 'data' in data['result']['table']:
+                n = int(data['result']['table']['data'][0][0])
+                return n > 0
+        return False
+    except Exception as e:
+        st.warning(f"Could not query exoplanet archive for {tic_id}: {str(e)}")
+        return False
+
 def run_analysis(tic_id):
     """Run the full analysis for a single TIC ID and return results and figures."""
     try:
+        # Check for confirmed exoplanet first
+        is_exoplanet_host = has_confirmed_exoplanet(tic_id)
+        
         # Data Fetch and Cleaning
         sector_data = search_lightcurve(tic_id)
         if len(sector_data) == 0:
-            return None, "No data found for TIC ID."
+            return None, "No data found for TIC ID.", {}
         lc = sector_data[1].download()
         lc_clean = clean_lightcurve(lc)
         time = lc_clean.time.value
@@ -122,11 +150,17 @@ def run_analysis(tic_id):
             '1% FAP (LS)': f"{fap:.5f}",
             'Amplitude': f"{amp:.2f}%",
             'RMS': f"{rms:.6f}",
-            'Relative Std Dev': f"{rel_std:.6f}"
+            'Relative Std Dev': f"{rel_std:.6f}",
+            'Confirmed Exoplanet Host': 'Yes' if is_exoplanet_host else 'No'
         }
         
+        # Updated Classification
         classification = ""
-        if ls_variable and bls_variable:
+        if is_exoplanet_host:
+            classification = "🌌 Confirmed Exoplanet Host Star (from NASA Exoplanet Archive)"
+            if ls_variable or bls_variable:
+                classification += " with detected variability (possible transits)"
+        elif ls_variable and bls_variable:
             classification = "✅ Confirmed VARIABLE STAR by both LS and BLS"
         elif ls_variable:
             classification = "⚠️ Variability detected by Lomb-Scargle only"
@@ -201,3 +235,7 @@ elif input_mode == "Upload CSV":
                             st.error(classification)
     else:
         st.info("Upload a CSV file with TIC IDs to get started.")
+
+# Example note
+st.sidebar.markdown("---")
+st.sidebar.info("**Example Confirmed Exoplanet Host:** Try TIC 261136679 (Pi Mensae, host of TESS-discovered planet Pi Men c)")
