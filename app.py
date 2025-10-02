@@ -73,10 +73,10 @@ def detect_transit_candidates(flux, bls_folded, anomaly_threshold=ANOMALY_THRESH
         
         is_transit_candidate = (anomaly_fraction > anomaly_threshold) and (clustered_anomalies > anomaly_threshold)
         
-        return is_transit_candidate, anomaly_fraction, num_anomalies
+        return is_transit_candidate, anomaly_fraction, num_anomalies, iso_forest
     except Exception as e:
         st.warning(f"ML anomaly detection failed: {str(e)}")
-        return False, 0.0, 0
+        return False, 0.0, 0, None
 
 def clean_tic_id(tic_id):
     """Clean TIC ID: remove 'TIC ' prefix, strip, and validate."""
@@ -146,7 +146,7 @@ def run_analysis(tic_id):
         bls_folded = lc_clean.fold(period=bls_best_period)
 
         # ML Anomaly Detection for Transit Candidates (after BLS)
-        is_transit_candidate, anomaly_fraction, num_anomalies = detect_transit_candidates(flux, bls_folded)
+        is_transit_candidate, anomaly_fraction, num_anomalies, iso_forest = detect_transit_candidates(flux, bls_folded)
 
         # Create figures
         figs = {}
@@ -154,13 +154,12 @@ def run_analysis(tic_id):
         # Cleaned LC with anomalies highlighted (ML viz)
         fig_lc, ax_lc = plt.subplots()
         lc_clean.plot(ax=ax_lc, title="Cleaned Light Curve with ML Anomalies")
-        # Refit for plotting
-        flux_norm_plot = ((flux - flux_mean) / flux_std).reshape(-1, 1)
-        iso_forest_plot = IsolationForest(contamination=0.1, random_state=42)
-        anomalies_plot = iso_forest_plot.fit_predict(flux_norm_plot) == -1
-        if np.sum(anomalies_plot) > 0:
-            ax_lc.scatter(time[anomalies_plot], flux[anomalies_plot], color='red', s=1, alpha=0.5, label='ML Anomalies')
-            ax_lc.legend()
+        if iso_forest is not None:
+            flux_norm_plot = ((flux - flux_mean) / flux_std).reshape(-1, 1)
+            anomalies_plot = iso_forest.predict(flux_norm_plot) == -1
+            if np.sum(anomalies_plot) > 0:
+                ax_lc.scatter(time[anomalies_plot], flux[anomalies_plot], color='red', s=1, alpha=0.5, label='ML Anomalies')
+                ax_lc.legend()
         figs['lc'] = fig_lc
         
         # LS Periodogram
@@ -189,12 +188,12 @@ def run_analysis(tic_id):
         # BLS Folded with anomalies
         fig_bls_fold, ax_bls_fold = plt.subplots()
         bls_folded.plot(ax=ax_bls_fold, title=f"BLS Folded Light Curve at {bls_best_period:.5f} days with ML Anomalies")
-        folded_flux_norm = ((bls_folded.flux.value - np.mean(bls_folded.flux.value)) / np.std(bls_folded.flux.value)).reshape(-1, 1)
-        iso_forest_fold = IsolationForest(contamination=0.1, random_state=42)
-        folded_anoms = iso_forest_fold.fit_predict(folded_flux_norm) == -1
-        if np.sum(folded_anoms) > 0:
-            ax_bls_fold.scatter(bls_folded.phase[folded_anoms], bls_folded.flux.value[folded_anoms], color='red', s=5, alpha=0.7, label='ML Anomalies')
-            ax_bls_fold.legend()
+        if iso_forest is not None:
+            folded_flux_norm = ((bls_folded.flux.value - np.mean(bls_folded.flux.value)) / np.std(bls_folded.flux.value)).reshape(-1, 1)
+            folded_anoms = iso_forest.predict(folded_flux_norm) == -1
+            if np.sum(folded_anoms) > 0:
+                ax_bls_fold.scatter(bls_folded.phase[folded_anoms], bls_folded.flux.value[folded_anoms], color='red', s=5, alpha=0.7, label='ML Anomalies')
+                ax_bls_fold.legend()
         figs['bls_fold'] = fig_bls_fold
 
         # Results dict
@@ -247,4 +246,67 @@ st.sidebar.header("Input Options")
 input_mode = st.sidebar.radio("Choose input method:", ("Single TIC ID", "Upload CSV"))
 
 if input_mode == "Single TIC ID":
-    tic_id = st.sidebar.text_input("Enter TIC ID (e.g.,
+    tic_id = st.sidebar.text_input("Enter TIC ID (e.g., TIC 168789840):", value="TIC 168789840")
+    if st.sidebar.button("Analyze"):
+        if tic_id:
+            with st.spinner("Analyzing with AI/ML..."):
+                results, classification, figs = run_analysis(tic_id)
+                if results:
+                    st.header(f"Results for {tic_id}")
+                    st.subheader("Key Metrics")
+                    for key, value in results.items():
+                        st.write(f"**{key}:** {value}")
+                    st.subheader("Classification")
+                    st.write(classification)
+                    
+                    st.subheader("Plots")
+                    for key, fig in figs.items():
+                        st.pyplot(fig)
+                        plt.close(fig)  # Close to free memory
+                else:
+                    st.error(classification)
+        else:
+            st.warning("Please enter a TIC ID.")
+
+elif input_mode == "Upload CSV":
+    uploaded_file = st.sidebar.file_uploader("Upload CSV with TIC IDs (one per row, no header):", type="csv")
+    if uploaded_file is not None:
+        df = pd.read_csv(uploaded_file, header=None)
+        # Clean and filter valid TIC IDs
+        raw_ids = df[0].tolist()
+        tic_ids = []
+        for raw_id in raw_ids:
+            try:
+                cleaned = clean_tic_id(raw_id)
+                tic_ids.append(cleaned)
+            except ValueError:
+                st.warning(f"Skipping invalid TIC ID: {raw_id}")
+        st.sidebar.write(f"Loaded {len(tic_ids)} valid TIC IDs from {len(raw_ids)} entries.")
+        
+        if st.sidebar.button("Analyze All"):
+            for i, tic_id in enumerate(tic_ids):
+                with st.expander(f"TIC {tic_id} ({i+1}/{len(tic_ids)})", expanded=False):
+                    with st.spinner(f"Analyzing TIC {tic_id} with AI/ML..."):
+                        results, classification, figs = run_analysis(f"TIC {tic_id}")  # Pass with prefix for display
+                        if results:
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                st.subheader("Key Metrics")
+                                for key, value in results.items():
+                                    st.write(f"**{key}:** {value}")
+                            with col2:
+                                st.subheader("Classification")
+                                st.write(classification)
+                            
+                            st.subheader("Plots")
+                            for key, fig in figs.items():
+                                st.pyplot(fig)
+                                plt.close(fig)
+                        else:
+                            st.error(classification)
+    else:
+        st.info("Upload a CSV file with TIC IDs to get started.")
+
+# Example note
+st.sidebar.markdown("---")
+st.sidebar.info("**Example Confirmed Exoplanet Host:** Try TIC 261136679 (Pi Mensae, host of TESS-discovered planet Pi Men c)\n\n**ML Feature:** Isolation Forest detects anomalous flux dips as potential transits.\n\n**Tip:** Ensure CSV has clean TIC IDs (e.g., 123456789, no 'TIC ID' labels).")
