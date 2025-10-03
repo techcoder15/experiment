@@ -22,6 +22,7 @@ RMS_THRESHOLD = 0.0005
 AMP_THRESHOLD = 0.5
 REL_STD_THRESHOLD = 0.001
 ANOMALY_THRESHOLD = 0.05  # Fraction of points flagged as anomalies to suggest potential transit
+PERIOD_TOLERANCE = 0.05  # 5% relative tolerance for period matching
 
 # --------------------------------------
 # FUNCTION DEFINITIONS (same as core, adapted for Streamlit)
@@ -57,20 +58,21 @@ def detect_transit_candidates(flux, bls_folded, anomaly_threshold=ANOMALY_THRESH
         # Normalize flux
         flux_norm = (flux - np.mean(flux)) / np.std(flux)
         
-        # Fit Isolation Forest
+        # Fit Isolation Forest on full flux
         iso_forest = IsolationForest(contamination=0.1, random_state=42)
-        anomalies = iso_forest.fit_predict(flux_norm.reshape(-1, 1))
+        iso_forest.fit(flux_norm.reshape(-1, 1))
+        anomalies = iso_forest.predict(flux_norm.reshape(-1, 1))
         
         # Count anomalies (negative labels are anomalies)
         num_anomalies = np.sum(anomalies == -1)
         anomaly_fraction = num_anomalies / len(flux)
         
-        # Check folded if provided
+        # Check folded if provided: predict (no refit)
         clustered_anomalies = 0.0
         if bls_folded is not None:
             folded_flux = bls_folded.flux.value
             folded_norm = (folded_flux - np.mean(folded_flux)) / np.std(folded_flux)
-            folded_anomalies = iso_forest.fit_predict(folded_norm.reshape(-1, 1))  # Refit for folded
+            folded_anomalies = iso_forest.predict(folded_norm.reshape(-1, 1))
             clustered_anomalies = np.sum(folded_anomalies == -1) / len(folded_flux)
         
         is_transit_candidate = (anomaly_fraction > anomaly_threshold) and (clustered_anomalies > anomaly_threshold)
@@ -92,11 +94,11 @@ def get_full_tic(tic_id):
     tic_num = clean_tic_id(tic_id)
     return f"TIC {tic_num}"
 
-def has_confirmed_exoplanet(tic_id):
-    """Query NASA Exoplanet Archive to check if the TIC ID hosts a confirmed exoplanet."""
+def get_exoplanet_info(tic_id):
+    """Query NASA Exoplanet Archive for confirmed planets and their orbital periods."""
     try:
         tic_clean = clean_tic_id(tic_id)
-        query = f"select count(*) as n from ps where tic_id = '{tic_clean}'"
+        query = f"select pl_name, pl_orbper from ps where tic_id = '{tic_clean}'"
         encoded_query = urllib.parse.quote(query)
         url = f"https://exoplanetarchive.ipac.caltech.edu/TAP/sync?query={encoded_query}&format=json"
         
@@ -104,12 +106,18 @@ def has_confirmed_exoplanet(tic_id):
         if response.status_code == 200:
             data = response.json()
             if data and 'result' in data and data['result'] and 'table' in data['result'] and 'data' in data['result']['table']:
-                n = int(data['result']['table']['data'][0][0])
-                return n > 0
-        return False
+                planets = []
+                for row in data['result']['table']['data']:
+                    name = row[0] if row[0] else 'Unknown'
+                    period_str = row[1]
+                    period = float(period_str) if period_str and str(period_str).lower() != 'nan' else None
+                    if period:
+                        planets.append((name, period))
+                return len(planets) > 0, planets
+        return False, []
     except Exception as e:
         st.warning(f"Could not query exoplanet archive for {tic_id}: {str(e)}")
-        return False
+        return False, []
 
 def run_analysis(tic_id):
     """Run the full analysis for a single TIC ID and return results and figures."""
@@ -117,8 +125,8 @@ def run_analysis(tic_id):
         full_tic = get_full_tic(tic_id)
         tic_clean = clean_tic_id(tic_id)
         
-        # Check for confirmed exoplanet first
-        is_exoplanet_host = has_confirmed_exoplanet(tic_id)
+        # Check for confirmed exoplanet info
+        is_exoplanet_host, planet_info = get_exoplanet_info(tic_id)
         
         # Data Fetch and Cleaning
         sector_data = search_lightcurve(full_tic)
@@ -155,6 +163,18 @@ def run_analysis(tic_id):
 
         # ML Anomaly Detection for Transit Candidates (after BLS)
         is_transit_candidate, anomaly_fraction, num_anomalies, iso_forest = detect_transit_candidates(flux, bls_folded)
+
+        # Check period matching for known planets
+        period_match = False
+        if is_exoplanet_host and planet_info:
+            detected_periods = [ls_best_period.value, bls_best_period]
+            for _, p_period in planet_info:
+                for det_period in detected_periods:
+                    if abs(det_period - p_period) / p_period < PERIOD_TOLERANCE:
+                        period_match = True
+                        break
+                if period_match:
+                    break
 
         # Create figures
         figs = {}
@@ -205,6 +225,7 @@ def run_analysis(tic_id):
         figs['bls_fold'] = fig_bls_fold
 
         # Results dict
+        known_planets = ', '.join([name for name, _ in planet_info]) if planet_info else 'None'
         results = {
             'LS Best Period': f"{ls_best_period.value:.5f} days",
             'LS Max Power': f"{ls_max_power:.5f}",
@@ -215,16 +236,22 @@ def run_analysis(tic_id):
             'RMS': f"{rms:.6f}",
             'Relative Std Dev': f"{rel_std:.6f}",
             'Confirmed Exoplanet Host': 'Yes' if is_exoplanet_host else 'No',
+            'Known Planets': known_planets,
+            'Period Matches Known Planet': 'Yes' if period_match else 'No',
             'ML Transit Candidate': 'Yes' if is_transit_candidate else 'No',
             'Anomaly Fraction': f"{anomaly_fraction:.3f}"
         }
         
-        # Updated Classification with ML
+        # Updated Classification with ML and Period Matching
         classification = ""
         if is_exoplanet_host:
             classification = "🌌 Confirmed Exoplanet Host Star (from NASA Exoplanet Archive)"
+            if period_match:
+                classification += " with detected period matching known planet orbit"
             if is_transit_candidate:
                 classification += " with ML-detected transit-like anomalies"
+            if ls_variable or bls_variable:
+                classification += " showing stellar/planetary variability"
         elif is_transit_candidate:
             classification = "🪐 ML Transit Candidate (anomalies suggest potential exoplanet signal)"
             if ls_variable or bls_variable:
@@ -317,4 +344,4 @@ elif input_mode == "Upload CSV":
 
 # Example note
 st.sidebar.markdown("---")
-st.sidebar.info("**Example Confirmed Exoplanet Host:** Try TIC 261136679 (Pi Mensae, host of TESS-discovered planet Pi Men c)\n\n**ML Feature:** Isolation Forest detects anomalous flux dips as potential transits.\n\n**Tip:** Ensure CSV has clean TIC IDs (e.g., 123456789, no 'TIC ID' labels).")
+st.sidebar.info("**Example Confirmed Exoplanet Host:** Try TIC 261136679 (Pi Mensae, host of TESS-discovered planet Pi Men c)\n\n**ML Feature:** Isolation Forest detects anomalous flux dips as potential transits.\n\n**New:** Period matching against known exoplanet orbits for better classification.\n\n**Tip:** Ensure CSV has clean TIC IDs (e.g., 123456789, no 'TIC ID' labels).")
