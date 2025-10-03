@@ -130,27 +130,52 @@ def get_exoplanet_info(tic_id):
         st.warning(f"Exoplanet query failed after retries for {tic_id}: {str(e)}. Treating as non-host.")
         return False, []  # Fallback: Assume no planets to avoid false negatives
 
-def run_analysis(tic_id):
+def run_analysis(tic_id, debug=False):
     """Run the full analysis for a single TIC ID and return results and figures."""
     try:
+        if debug:
+            st.info(f"🔍 Debug: Starting analysis for {tic_id}")
+        
         full_tic = get_full_tic(tic_id)
         tic_clean = clean_tic_id(tic_id)
         
+        if debug:
+            st.info(f"🔍 Debug: Cleaned TIC: {tic_clean}")
+        
         # Check for confirmed exoplanet info
+        if debug:
+            st.info("🔍 Debug: Querying exoplanet archive...")
         is_exoplanet_host, planet_info = get_exoplanet_info(tic_id)
         
+        if debug:
+            st.info(f"🔍 Debug: Exoplanet host: {is_exoplanet_host}, Planets: {len(planet_info)}")
+        
         # Data Fetch and Cleaning
+        if debug:
+            st.info("🔍 Debug: Fetching light curve data...")
         sector_data = search_lightcurve(full_tic)
         if len(sector_data) == 0:
             return None, "No data found for TIC ID.", {}
         lc = sector_data[1].download()
+        if debug:
+            st.info(f"🔍 Debug: Downloaded LC from sector {sector_data[1].mission} {sector_data[1].sector}")
+        
+        if debug:
+            st.info("🔍 Debug: Cleaning light curve...")
         lc_clean = clean_lightcurve(lc)
         time = lc_clean.time.value
         flux = lc_clean.flux.value
+        if debug:
+            st.info(f"🔍 Debug: LC cleaned - {len(time)} points")
+        
         amp, rms, flux_mean, flux_std = compute_flux_stats(flux)
         rel_std = flux_std / flux_mean
+        if debug:
+            st.info(f"🔍 Debug: Flux stats computed - Amp: {amp:.2f}%, RMS: {rms:.6f}")
 
         # Lomb-Scargle Analysis
+        if debug:
+            st.info("🔍 Debug: Running Lomb-Scargle...")
         lk_periodogram = lc_clean.to_periodogram(method="lombscargle", minimum_period=MIN_PERIOD, maximum_period=MAX_PERIOD)
         ls_best_period = lk_periodogram.period_at_max_power
         ls_max_power = lk_periodogram.max_power
@@ -159,21 +184,33 @@ def run_analysis(tic_id):
         fap = ls.false_alarm_level(FAP_LEVEL)
         ls_variable = classify_variable(ls_max_power.value if hasattr(ls_max_power, "value") else ls_max_power,
                                         fap, amp, rms, rel_std)
+        if debug:
+            st.info(f"🔍 Debug: LS complete - Best period: {ls_best_period.value:.5f}, Variable: {ls_variable}")
 
         # BLS Analysis
+        if debug:
+            st.info("🔍 Debug: Running BLS...")
         bls = BoxLeastSquares(time, flux)
         bls_periods = np.linspace(MIN_PERIOD + 0.01, MAX_PERIOD, 10000)
         bls_result = bls.power(bls_periods, BLS_DURATION)
         bls_best_period = bls_result.period[np.argmax(bls_result.power)]
         bls_max_power = np.max(bls_result.power)
         bls_variable = classify_variable(bls_max_power, BLS_POWER_THRESHOLD, amp, rms, rel_std)
+        if debug:
+            st.info(f"🔍 Debug: BLS complete - Best period: {bls_best_period:.5f}, Variable: {bls_variable}")
 
         # Folded Light Curves
         ls_folded = lc_clean.fold(period=ls_best_period)
         bls_folded = lc_clean.fold(period=bls_best_period)
+        if debug:
+            st.info("🔍 Debug: Folded light curves created")
 
         # ML Anomaly Detection for Transit Candidates (after BLS)
+        if debug:
+            st.info("🔍 Debug: Running ML anomaly detection...")
         is_transit_candidate, anomaly_fraction, num_anomalies, iso_forest = detect_transit_candidates(flux, bls_folded)
+        if debug:
+            st.info(f"🔍 Debug: ML complete - Transit candidate: {is_transit_candidate}, Anomalies: {num_anomalies}")
 
         # Check period matching for known planets
         period_match = False
@@ -186,6 +223,11 @@ def run_analysis(tic_id):
                         break
                 if period_match:
                     break
+            if debug:
+                st.info(f"🔍 Debug: Period match: {period_match}")
+
+        if debug:
+            st.info("🔍 Debug: Creating plots...")
 
         # Create figures
         figs = {}
@@ -234,6 +276,9 @@ def run_analysis(tic_id):
                 ax_bls_fold.scatter(bls_folded.phase[folded_anoms], bls_folded.flux.value[folded_anoms], color='red', s=5, alpha=0.7, label='ML Anomalies')
                 ax_bls_fold.legend()
         figs['bls_fold'] = fig_bls_fold
+
+        if debug:
+            st.info("🔍 Debug: Analysis complete - Displaying results")
 
         # Results dict
         known_planets = ', '.join([name for name, _ in planet_info]) if planet_info else 'None'
@@ -290,6 +335,7 @@ st.set_page_config(layout="wide", page_title="TESS Analyzer")
 
 # Sidebar for input options
 st.sidebar.header("Input Options")
+debug_mode = st.sidebar.checkbox("Enable Debug Mode (Show Analysis Steps)", value=False)
 input_mode = st.sidebar.radio("Choose input method:", ("Single TIC ID", "Upload CSV"))
 
 if input_mode == "Single TIC ID":
@@ -297,7 +343,7 @@ if input_mode == "Single TIC ID":
     if st.sidebar.button("Analyze"):
         if tic_id:
             with st.spinner("Analyzing with AI/ML..."):
-                results, classification, figs = run_analysis(tic_id)
+                results, classification, figs = run_analysis(tic_id, debug=debug_mode)
                 if results:
                     st.header(f"Results for {tic_id}")
                     st.subheader("Key Metrics")
@@ -337,7 +383,7 @@ elif input_mode == "Upload CSV":
             for i, full_tic in enumerate(tic_ids):
                 with st.expander(f"{full_tic} ({i+1}/{len(tic_ids)})", expanded=False):
                     with st.spinner(f"Analyzing {full_tic} with AI/ML..."):
-                        results, classification, figs = run_analysis(full_tic)
+                        results, classification, figs = run_analysis(full_tic, debug=debug_mode)
                         if results:
                             col1, col2 = st.columns(2)
                             with col1:
