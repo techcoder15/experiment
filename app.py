@@ -127,7 +127,7 @@ def get_exoplanet_info(tic_id):
             return len(planets) > 0, planets
         return False, []
     except Exception as e:
-        st.warning(f"Exoplanet query failed after retries for {tic_id}: {str(e)}. Treating as non-host.")
+        # Removed st.warning to avoid side effects in cached function
         return False, []  # Fallback: Assume no planets to avoid false negatives
 
 def run_analysis(tic_id, debug=False):
