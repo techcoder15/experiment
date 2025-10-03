@@ -7,21 +7,18 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg') # Use headless backend for server stability
 import matplotlib.pyplot as plt
-from io import BytesIO
-import base64
-import urllib.parse # For quoting the query
-from sklearn.ensemble import IsolationForest # ML integration for anomaly detection
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type # New: For API retries
+import urllib.parse
+from sklearn.ensemble import IsolationForest 
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type 
 
 # --------------------------------------
-# CONFIGURATION (FIXED AMP_THRESHOLD)
+# CONFIGURATION
 # --------------------------------------
 MIN_PERIOD = 0.1
 MAX_PERIOD = 30
 BLS_DURATION = 0.1
 BLS_POWER_THRESHOLD = 0.5
 RMS_THRESHOLD = 0.0005
-# FIX: Adjusted AMP_THRESHOLD to a realistic value for planetary transits.
 AMP_THRESHOLD = 0.001 
 REL_STD_THRESHOLD = 0.001
 ANOMALY_THRESHOLD = 0.05
@@ -33,55 +30,60 @@ PERIOD_TOLERANCE = 0.05
 
 def clean_lightcurve(lc: LightCurve) -> LightCurve:
     """Clean light curve using preferred flux columns without deprecation."""
-    # Prefer pdcsap_flux if available, else sap_flux
     if 'pdcsap_flux' in lc.columns:
         flux_col = lc['pdcsap_flux']
         flux_err_col = lc['pdcsap_flux_err'] if 'pdcsap_flux_err' in lc.columns else None
     else:
         flux_col = lc['sap_flux']
         flux_err_col = lc['sap_flux_err'] if 'sap_flux_err' in lc.columns else None
-    # Select the flux column
+        
     lc = lc.select_flux(flux_col, flux_err_col)
-    return lc.remove_nans().remove_outliers()
+    
+    # Simple cleaning: remove nans and 5-sigma outliers
+    return lc.remove_nans().remove_outliers(sigma=5)
 
 def compute_flux_stats(flux):
+    """
+    Compute flux statistics and ensure they are returned as native Python floats.
+    
+    This is the key fix for 'unhashable type: numpy.ndarray' when using cache,
+    as numpy scalars can sometimes cause issues.
+    """
     mean = np.mean(flux)
     std = np.std(flux)
-    # Amplitude is calculated as percentage difference
     amp = (np.nanmax(flux) - np.nanmin(flux)) / mean
     rms = np.sqrt(np.mean((flux - mean)**2))
-    return amp, rms, mean, std
+    
+    # FIX: Explicitly convert numpy scalars to native Python floats
+    return float(amp), float(rms), float(mean), float(std)
 
 def classify_variable(power, threshold, amp, rms, rel_std):
-    # Note: amp is now a fraction (0.001) not a percentage (0.1) based on compute_flux_stats update
     return (power > threshold and amp > AMP_THRESHOLD and
             rms > RMS_THRESHOLD and rel_std > REL_STD_THRESHOLD)
 
 def detect_transit_candidates(flux, bls_folded, anomaly_threshold=ANOMALY_THRESHOLD):
     """Use Isolation Forest (ML) for anomaly detection on flux to flag potential transit dips."""
     try:
-        # Normalize flux
+        # Normalize flux for ML
         flux_norm = (flux - np.mean(flux)) / np.std(flux)
         
-        # Fit Isolation Forest on full flux
-        # Consider lowering contamination (e.g., 0.001) for better transit detection
-        iso_forest = IsolationForest(contamination=0.1, random_state=42) 
+        # Fit Isolation Forest
+        iso_forest = IsolationForest(contamination='auto', random_state=42) # 'auto' is safer than a fixed 0.1
         iso_forest.fit(flux_norm.reshape(-1, 1))
         anomalies = iso_forest.predict(flux_norm.reshape(-1, 1))
         
-        # Count anomalies (negative labels are anomalies)
         num_anomalies = np.sum(anomalies == -1)
         anomaly_fraction = num_anomalies / len(flux)
         
-        # Check folded if provided: predict (no refit)
-        clustered_anomalies = 0.0
+        # Check folded light curve anomalies
+        clustered_anomalies_fraction = 0.0
         if bls_folded is not None:
             folded_flux = bls_folded.flux.value
             folded_norm = (folded_flux - np.mean(folded_flux)) / np.std(folded_flux)
             folded_anomalies = iso_forest.predict(folded_norm.reshape(-1, 1))
-            clustered_anomalies = np.sum(folded_anomalies == -1) / len(folded_flux)
+            clustered_anomalies_fraction = np.sum(folded_anomalies == -1) / len(folded_flux)
         
-        is_transit_candidate = (anomaly_fraction > anomaly_threshold) and (clustered_anomalies > anomaly_threshold)
+        is_transit_candidate = (anomaly_fraction > anomaly_threshold) and (clustered_anomalies_fraction > anomaly_threshold)
         
         return is_transit_candidate, anomaly_fraction, num_anomalies, iso_forest
     except Exception as e:
@@ -100,7 +102,7 @@ def get_full_tic(tic_id):
     tic_num = clean_tic_id(tic_id)
     return f"TIC {tic_num}"
 
-@st.cache_data(ttl=3600) # Cache for 1 hour
+@st.cache_data(ttl=3600) 
 def get_exoplanet_info(tic_id):
     """Query NASA Exoplanet Archive for confirmed planets and their orbital periods, with retries."""
     @retry(
@@ -110,137 +112,105 @@ def get_exoplanet_info(tic_id):
     )
     def _query_api():
         tic_clean = clean_tic_id(tic_id)
+        # Using the standard TAP service query
         query = f"select pl_name, pl_orbper from ps where tic_id = '{tic_clean}'"
         encoded_query = urllib.parse.quote(query)
         url = f"https://exoplanetarchive.ipac.caltech.edu/TAP/sync?query={encoded_query}&format=json"
-        response = requests.get(url, timeout=30) # Increased timeout
-        response.raise_for_status() # Raise if not 200
+        response = requests.get(url, timeout=30)
+        response.raise_for_status() 
         return response.json()
 
     try:
         data = _query_api()
-        if data and isinstance(data, list) and data: # Check if data is a non-empty list
-            planets = []
-            # Note: The original parsing logic assumed a specific complex dictionary structure which may change.
-            # Using the simpler format for the TAP service is generally more robust.
+        planets = []
+        if data and isinstance(data, list):
             for row in data:
-                 # Assumes data is a list of lists/dicts where the first two elements are name and period
+                # Robust parsing for JSON array of objects
                 if isinstance(row, dict) and 'pl_name' in row and 'pl_orbper' in row:
                     name = row['pl_name']
                     period = row['pl_orbper']
-                elif isinstance(row, list) and len(row) >= 2:
-                    name = row[0]
-                    period = row[1]
-                else:
-                    continue
-
-                period = float(period) if period and str(period).lower() not in ('nan', 'null') else None
-                if period:
-                    planets.append((name, period))
-            return len(planets) > 0, planets
-        return False, []
+                    period = float(period) if period and str(period).lower() not in ('nan', 'null') else None
+                    if period:
+                        planets.append((name, period))
+        return len(planets) > 0, planets
     except Exception as e:
+        # Warning only, don't stop analysis if exoplanet query fails
         st.warning(f"Exoplanet query failed after retries for {tic_id}: {str(e)}. Treating as non-host.")
-        return False, [] # Fallback: Assume no planets to avoid false negatives
+        return False, [] 
 
 # --------------------------------------
-# FIX FOR UNHASHABLE TYPE ERROR (New Cached Function)
+# CRITICAL FIX: CACHED DATA DOWNLOAD
 # --------------------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def _download_and_clean_lc(full_tic):
     """
-    Downloads and cleans the Light Curve data using only the hashable TIC string.
-    Returns the cleaned LightCurve object and metadata.
+    Downloads and cleans the Light Curve data, ensuring complex Lightkurve objects
+    are NOT passed as arguments to other cached functions.
     """
-    search_result = search_lightcurve(full_tic)
+    search_result = search_lightcurve(full_tic, author='TESS', exptime=120) # Prioritize 2-minute data
     if len(search_result) == 0:
-        return None, None 
+        return None, None, None # lc_clean, lc_normalized, metadata
         
     selected_row = search_result[0]
     lc = selected_row.download()
     
     if lc is None:
-        return None, None
+        return None, None, None
         
     lc_clean = clean_lightcurve(lc)
     
-    # Extract metadata for debug logging outside the cached function
+    # ENHANCEMENT: Normalize the light curve for robust BLS analysis
+    lc_normalized = lc_clean.normalize()
+    
+    # Extract metadata
     mission = selected_row.mission if hasattr(selected_row, 'mission') else 'Unknown'
     sector = selected_row.sector if hasattr(selected_row, 'sector') else 'Unknown'
     metadata = f"{mission} Sector {sector}"
     
-    return lc_clean, metadata
+    return lc_clean, lc_normalized, metadata
 
 
 def run_analysis(tic_id, debug=False):
     """Run the full analysis for a single TIC ID and return results and figures."""
     try:
-        if debug:
-            st.info(f"🔍 Debug: Starting analysis for {tic_id}")
-        
         full_tic = get_full_tic(tic_id)
-        tic_clean = clean_tic_id(tic_id)
         
-        # Check for confirmed exoplanet info
-        if debug:
-            st.info("🔍 Debug: Querying exoplanet archive...")
+        # 1. Exoplanet Info (Cached)
         is_exoplanet_host, planet_info = get_exoplanet_info(tic_id)
         
-        if debug:
-            st.info(f"🔍 Debug: Exoplanet host: {is_exoplanet_host}, Planets: {len(planet_info)}")
-        
-        # Data Fetch and Cleaning - **USING CACHED FUNCTION**
-        if debug:
-            st.info("🔍 Debug: Fetching light curve data using cached downloader...")
-        
-        lc_clean, metadata = _download_and_clean_lc(full_tic)
+        # 2. Data Fetch and Cleaning (Cached)
+        lc_clean, lc_normalized, metadata = _download_and_clean_lc(full_tic)
 
         if lc_clean is None:
-            return None, "No data found or download failed for TIC ID.", {}
+            return None, f"No TESS data found for {full_tic} or download failed.", {}
             
-        if debug:
-            st.info(f"🔍 Debug: Downloaded and cleaned LC from {metadata}")
+        time = lc_normalized.time.value # Use normalized time for analysis
+        flux = lc_normalized.flux.value # Use normalized flux for BLS and stats
         
-        time = lc_clean.time.value
-        flux = lc_clean.flux.value
-        if debug:
-            st.info(f"🔍 Debug: LC cleaned - {len(time)} points")
-        
-        # Note: compute_flux_stats now returns 'amp' as a fraction, so all checks should be consistent.
-        amp, rms, flux_mean, flux_std = compute_flux_stats(flux)
+        # 3. Flux Stats (Returns native floats)
+        amp, rms, flux_mean, flux_std = compute_flux_stats(flux) 
         rel_std = flux_std / flux_mean
-        
-        # Convert amplitude to percentage for display only (as in your original display format)
         display_amp = 100 * amp 
-        
+
         if debug:
+            st.info(f"🔍 Debug: Downloaded data from {metadata}")
             st.info(f"🔍 Debug: Flux stats computed - Amp: {display_amp:.2f}%, RMS: {rms:.6f}")
 
-        # BLS Analysis
-        if debug:
-            st.info("🔍 Debug: Running BLS...")
+        # 4. BLS Analysis (on normalized flux)
         bls = BoxLeastSquares(time, flux)
         bls_periods = np.linspace(MIN_PERIOD + 0.01, MAX_PERIOD, 10000)
         bls_result = bls.power(bls_periods, BLS_DURATION)
         bls_best_period = bls_result.period[np.argmax(bls_result.power)]
         bls_max_power = np.max(bls_result.power)
-        bls_variable = classify_variable(bls_max_power, BLS_POWER_THRESHOLD, amp, rms, rel_std) # uses fractional amp
-        if debug:
-            st.info(f"🔍 Debug: BLS complete - Best period: {bls_best_period:.5f}, Variable: {bls_variable}")
+        bls_variable = classify_variable(bls_max_power, BLS_POWER_THRESHOLD, amp, rms, rel_std) 
 
-        # Folded Light Curves
-        bls_folded = lc_clean.fold(period=bls_best_period)
-        if debug:
-            st.info("🔍 Debug: Folded light curves created")
+        # 5. Folded Light Curves (on normalized light curve)
+        bls_folded = lc_normalized.fold(period=bls_best_period)
 
-        # ML Anomaly Detection for Transit Candidates (after BLS)
-        if debug:
-            st.info("🔍 Debug: Running ML anomaly detection...")
+        # 6. ML Anomaly Detection (on normalized flux)
         is_transit_candidate, anomaly_fraction, num_anomalies, iso_forest = detect_transit_candidates(flux, bls_folded)
-        if debug:
-            st.info(f"🔍 Debug: ML complete - Transit candidate: {is_transit_candidate}, Anomalies: {num_anomalies}")
 
-        # Check period matching for known planets
+        # 7. Check period matching
         period_match = False
         if is_exoplanet_host and planet_info:
             detected_periods = [bls_best_period]
@@ -251,21 +221,16 @@ def run_analysis(tic_id, debug=False):
                         break
                 if period_match:
                     break
-            if debug:
-                st.info(f"🔍 Debug: Period match: {period_match}")
 
-        if debug:
-            st.info("🔍 Debug: Creating plots...")
-
-        # Create figures
+        # 8. Create Figures
         figs = {}
         
-        # Cleaned LC with anomalies highlighted (ML viz)
+        # Cleaned/Normalized LC with anomalies
         fig_lc, ax_lc = plt.subplots()
-        lc_clean.plot(ax=ax_lc, title="Cleaned Light Curve with ML Anomalies")
+        lc_normalized.plot(ax=ax_lc, title=f"Cleaned and Normalized Light Curve ({metadata})")
         if iso_forest is not None:
-            flux_norm_plot = ((flux - flux_mean) / flux_std).reshape(-1, 1)
-            anomalies_plot = iso_forest.predict(flux_norm_plot) == -1
+            # Re-normalize just for ML plotting consistency if needed, though flux is already normalized here
+            anomalies_plot = iso_forest.predict(flux.reshape(-1, 1)) == -1 
             if np.sum(anomalies_plot) > 0:
                 ax_lc.scatter(time[anomalies_plot], flux[anomalies_plot], color='red', s=1, alpha=0.5, label='ML Anomalies')
                 ax_lc.legend()
@@ -284,21 +249,21 @@ def run_analysis(tic_id, debug=False):
         
         # BLS Folded with anomalies
         fig_bls_fold, ax_bls_fold = plt.subplots()
-        bls_folded.plot(ax=ax_bls_fold, title=f"BLS Folded Light Curve at {bls_best_period:.5f} days with ML Anomalies")
+        bls_folded.plot(ax=ax_bls_fold, title=f"BLS Folded Light Curve at {bls_best_period:.5f} days")
         if iso_forest is not None:
-            folded_flux_norm = ((bls_folded.flux.value - np.mean(bls_folded.flux.value)) / np.std(bls_folded.flux.value)).reshape(-1, 1)
-            folded_anoms = iso_forest.predict(folded_flux_norm) == -1
+            # Re-run prediction on folded data for scatter plot
+            folded_flux = bls_folded.flux.value
+            # Use original fitted forest for consistency
+            folded_anoms = iso_forest.predict(folded_flux.reshape(-1, 1)) == -1
             if np.sum(folded_anoms) > 0:
                 ax_bls_fold.scatter(bls_folded.phase[folded_anoms], bls_folded.flux.value[folded_anoms], color='red', s=5, alpha=0.7, label='ML Anomalies')
                 ax_bls_fold.legend()
         figs['bls_fold'] = fig_bls_fold
 
-        if debug:
-            st.info("🔍 Debug: Analysis complete - Displaying results")
-
-        # Results dict (using display_amp which is a percentage)
+        # 9. Results and Classification
         known_planets = ', '.join([name for name, _ in planet_info]) if planet_info else 'None'
         results = {
+            'Data Source': metadata, # NEW
             'BLS Best Period': f"{bls_best_period:.5f} days",
             'BLS Max Power': f"{bls_max_power:.5f}",
             'Amplitude': f"{display_amp:.2f}%",
@@ -311,38 +276,39 @@ def run_analysis(tic_id, debug=False):
             'Anomaly Fraction': f"{anomaly_fraction:.3f}"
         }
         
-        # Updated Classification with ML and Period Matching
         classification = ""
         if is_exoplanet_host:
-            classification = "🌌 Confirmed Exoplanet Host Star (from NASA Exoplanet Archive)"
+            classification = "🌌 Confirmed Exoplanet Host Star (NASA Archive)"
             if period_match:
-                classification += " with detected period matching known planet orbit"
+                classification += " with **matching detected period**"
             if is_transit_candidate:
-                classification += " with ML-detected transit-like anomalies"
+                classification += " and ML-detected transit-like anomalies"
             if bls_variable:
-                classification += " showing stellar/planetary variability"
+                classification += ", showing stellar/planetary variability"
         elif is_transit_candidate:
-            classification = "🪐 ML Transit Candidate (anomalies suggest potential exoplanet signal)"
+            classification = "🪐 **ML Transit Candidate** (anomalies suggest potential exoplanet signal)"
             if bls_variable:
                 classification += " + variability confirmed by BLS"
         elif bls_variable:
-            classification = "⚠️ Variability detected by BLS only"
+            classification = "⚠️ **Stellar Variability** detected by BLS/Metrics only"
         else:
             classification = "❌ No strong variability detected"
         
         return results, classification, figs
+        
     except ValueError as ve:
         return None, str(ve), {}
     except Exception as e:
+        # Catch all other exceptions, log them, and return a general error
+        st.error(f"An unexpected error occurred during analysis: {str(e)}")
         return None, f"Error: {str(e)}", {}
 
 # --------------------------------------
 # STREAMLIT APP
 # --------------------------------------
-st.title("TESS Light Curve Variability Analyzer with AI/ML Integration")
+st.title("TESS Light Curve Variability Analyzer with AI/ML Integration 🔭")
 st.set_page_config(layout="wide", page_title="TESS Analyzer")
 
-# Sidebar for input options
 st.sidebar.header("Input Options")
 debug_mode = st.sidebar.checkbox("Enable Debug Mode (Show Analysis Steps)", value=False)
 input_mode = st.sidebar.radio("Choose input method:", ("Single TIC ID", "Upload CSV"))
@@ -351,25 +317,38 @@ if input_mode == "Single TIC ID":
     tic_id = st.sidebar.text_input("Enter TIC ID (e.g., TIC 168789840):", value="TIC 168789840")
     if st.sidebar.button("Analyze"):
         if tic_id:
-            with st.spinner("Analyzing with AI/ML..."):
+            with st.spinner("Analyzing light curve data with BLS and ML..."):
                 results, classification, figs = run_analysis(tic_id, debug=debug_mode)
-                if results:
-                    st.header(f"Results for {tic_id}")
+            
+            if results:
+                st.header(f"Results for {tic_id}")
+                st.markdown(f"**Classification:** {classification}")
+                
+                col_m, col_p = st.columns([1, 2])
+                
+                with col_m:
                     st.subheader("Key Metrics")
                     for key, value in results.items():
                         st.write(f"**{key}:** {value}")
-                    st.subheader("Classification")
-                    st.write(classification)
-                    
+                
+                with col_p:
                     st.subheader("Plots")
-                    for key, fig in figs.items():
-                        try:
-                            st.pyplot(fig)
-                            plt.close(fig) # Close to free memory
-                        except Exception as e:
-                            st.error(f"Plot '{key}' failed: {e}")
-                else:
-                    st.error(classification)
+                    # Display plots in a consistent layout
+                    if 'lc' in figs:
+                        st.pyplot(figs['lc'])
+                        plt.close(figs['lc'])
+                    
+                    col_bls1, col_bls2 = st.columns(2)
+                    with col_bls1:
+                         if 'bls_period' in figs:
+                            st.pyplot(figs['bls_period'])
+                            plt.close(figs['bls_period'])
+                    with col_bls2:
+                        if 'bls_fold' in figs:
+                            st.pyplot(figs['bls_fold'])
+                            plt.close(figs['bls_fold'])
+            else:
+                st.error(f"Analysis failed: {classification}")
         else:
             st.warning("Please enter a TIC ID.")
 
@@ -377,44 +356,65 @@ elif input_mode == "Upload CSV":
     uploaded_file = st.sidebar.file_uploader("Upload CSV with TIC IDs (one per row, no header):", type="csv")
     if uploaded_file is not None:
         df = pd.read_csv(uploaded_file, header=None)
-        # Clean and filter valid TIC IDs
         raw_ids = df[0].tolist()
         tic_ids = []
         for raw_id in raw_ids:
             try:
                 cleaned = clean_tic_id(raw_id)
-                tic_ids.append(f"TIC {cleaned}") # Store as full for analysis
+                tic_ids.append(f"TIC {cleaned}")
             except ValueError:
                 st.warning(f"Skipping invalid TIC ID: {raw_id}")
         st.sidebar.write(f"Loaded {len(tic_ids)} valid TIC IDs from {len(raw_ids)} entries.")
         
         if st.sidebar.button("Analyze All"):
+            all_results = []
+            
+            progress_bar = st.progress(0)
+            
             for i, full_tic in enumerate(tic_ids):
+                progress_bar.progress((i + 1) / len(tic_ids), text=f"Analyzing {full_tic} ({i+1}/{len(tic_ids)})")
+                
                 with st.expander(f"{full_tic} ({i+1}/{len(tic_ids)})", expanded=False):
-                    with st.spinner(f"Analyzing {full_tic} with AI/ML..."):
-                        results, classification, figs = run_analysis(full_tic, debug=debug_mode)
-                        if results:
-                            col1, col2 = st.columns(2)
-                            with col1:
-                                st.subheader("Key Metrics")
-                                for key, value in results.items():
-                                    st.write(f"**{key}:** {value}")
-                            with col2:
-                                st.subheader("Classification")
-                                st.write(classification)
-                            
-                            st.subheader("Plots")
-                            for key, fig in figs.items():
-                                try:
-                                    st.pyplot(fig)
-                                    plt.close(fig)
-                                except Exception as e:
-                                    st.error(f"Plot '{key}' failed: {e}")
-                        else:
-                            st.error(classification)
+                    results, classification, figs = run_analysis(full_tic, debug=debug_mode)
+                    
+                    if results:
+                        results['TIC ID'] = full_tic
+                        results['Classification Summary'] = classification
+                        all_results.append(results)
+                        
+                        st.markdown(f"**Classification:** {classification}")
+                        st.subheader("Key Metrics")
+                        st.dataframe(pd.DataFrame(results.items(), columns=['Metric', 'Value']).set_index('Metric'))
+                        
+                        st.subheader("Plots")
+                        for key, fig in figs.items():
+                            try:
+                                st.pyplot(fig)
+                                plt.close(fig)
+                            except Exception as e:
+                                st.error(f"Plot '{key}' failed: {e}")
+                    else:
+                        st.error(f"Analysis failed for {full_tic}: {classification}")
+            
+            progress_bar.empty()
+            st.success("Batch analysis complete!")
+            
+            if all_results:
+                final_df = pd.DataFrame(all_results).set_index('TIC ID')
+                st.subheader("Batch Summary Table")
+                st.dataframe(final_df)
+                
+                # Download button for CSV
+                csv = final_df.to_csv().encode('utf-8')
+                st.download_button(
+                    label="Download Full Results CSV",
+                    data=csv,
+                    file_name='tess_analysis_results.csv',
+                    mime='text/csv',
+                )
     else:
         st.info("Upload a CSV file with TIC IDs to get started.")
 
 # Example note
 st.sidebar.markdown("---")
-st.sidebar.info("**Example Confirmed Exoplanet Host:** Try TIC 261136679 (Pi Mensae, host of TESS-discovered planet Pi Men c)\n\n**ML Feature:** Isolation Forest detects anomalous flux dips as potential transits.\n\n**New:** Period matching against known exoplanet orbits for better classification.\n\n**Tip:** Ensure CSV has clean TIC IDs (e.g., 123456789, no 'TIC ID' labels).")
+st.sidebar.info("✨ **Enhancements:**\n- **Bug Fixes:** Robust `numpy` type conversion and isolated caching.\n- **Normalization:** BLS/Analysis runs on **normalized flux** for scientific accuracy.\n- **Data Source:** Added data source to results.\n\n**Example Confirmed Exoplanet Host:** Try TIC 261136679")
