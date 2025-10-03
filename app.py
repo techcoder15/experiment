@@ -1,17 +1,17 @@
 import streamlit as st
 import pandas as pd
 import requests
-from lightkurve import search_lightcurve
+from lightkurve import search_lightcurve, LightCurve
 from astropy.timeseries import BoxLeastSquares
 import numpy as np
 import matplotlib
-matplotlib.use('Agg')  # Use headless backend for server stability
+matplotlib.use('Agg') # Use headless backend for server stability
 import matplotlib.pyplot as plt
 from io import BytesIO
 import base64
-import urllib.parse  # For quoting the query
-from sklearn.ensemble import IsolationForest  # ML integration for anomaly detection
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type  # New: For API retries
+import urllib.parse # For quoting the query
+from sklearn.ensemble import IsolationForest # ML integration for anomaly detection
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type # New: For API retries
 
 # --------------------------------------
 # CONFIGURATION (FIXED AMP_THRESHOLD)
@@ -21,18 +21,17 @@ MAX_PERIOD = 30
 BLS_DURATION = 0.1
 BLS_POWER_THRESHOLD = 0.5
 RMS_THRESHOLD = 0.0005
-# FIX: Adjusted AMP_THRESHOLD from 0.5 (50% dip) to 0.001 (0.1% dip)
-# 0.001 is a more realistic threshold to catch all but the smallest planets.
+# FIX: Adjusted AMP_THRESHOLD to a realistic value for planetary transits.
 AMP_THRESHOLD = 0.001 
 REL_STD_THRESHOLD = 0.001
 ANOMALY_THRESHOLD = 0.05
 PERIOD_TOLERANCE = 0.05
 
 # --------------------------------------
-# FUNCTION DEFINITIONS (same as core, adapted for Streamlit)
+# FUNCTION DEFINITIONS 
 # --------------------------------------
 
-def clean_lightcurve(lc):
+def clean_lightcurve(lc: LightCurve) -> LightCurve:
     """Clean light curve using preferred flux columns without deprecation."""
     # Prefer pdcsap_flux if available, else sap_flux
     if 'pdcsap_flux' in lc.columns:
@@ -48,11 +47,13 @@ def clean_lightcurve(lc):
 def compute_flux_stats(flux):
     mean = np.mean(flux)
     std = np.std(flux)
-    amp = 100 * (np.nanmax(flux) - np.nanmin(flux)) / mean
+    # Amplitude is calculated as percentage difference
+    amp = (np.nanmax(flux) - np.nanmin(flux)) / mean
     rms = np.sqrt(np.mean((flux - mean)**2))
     return amp, rms, mean, std
 
 def classify_variable(power, threshold, amp, rms, rel_std):
+    # Note: amp is now a fraction (0.001) not a percentage (0.1) based on compute_flux_stats update
     return (power > threshold and amp > AMP_THRESHOLD and
             rms > RMS_THRESHOLD and rel_std > REL_STD_THRESHOLD)
 
@@ -63,7 +64,8 @@ def detect_transit_candidates(flux, bls_folded, anomaly_threshold=ANOMALY_THRESH
         flux_norm = (flux - np.mean(flux)) / np.std(flux)
         
         # Fit Isolation Forest on full flux
-        iso_forest = IsolationForest(contamination=0.1, random_state=42)
+        # Consider lowering contamination (e.g., 0.001) for better transit detection
+        iso_forest = IsolationForest(contamination=0.1, random_state=42) 
         iso_forest.fit(flux_norm.reshape(-1, 1))
         anomalies = iso_forest.predict(flux_norm.reshape(-1, 1))
         
@@ -98,7 +100,7 @@ def get_full_tic(tic_id):
     tic_num = clean_tic_id(tic_id)
     return f"TIC {tic_num}"
 
-@st.cache_data(ttl=3600)  # Cache for 1 hour
+@st.cache_data(ttl=3600) # Cache for 1 hour
 def get_exoplanet_info(tic_id):
     """Query NASA Exoplanet Archive for confirmed planets and their orbital periods, with retries."""
     @retry(
@@ -111,25 +113,64 @@ def get_exoplanet_info(tic_id):
         query = f"select pl_name, pl_orbper from ps where tic_id = '{tic_clean}'"
         encoded_query = urllib.parse.quote(query)
         url = f"https://exoplanetarchive.ipac.caltech.edu/TAP/sync?query={encoded_query}&format=json"
-        response = requests.get(url, timeout=30)  # Increased timeout
-        response.raise_for_status()  # Raise if not 200
+        response = requests.get(url, timeout=30) # Increased timeout
+        response.raise_for_status() # Raise if not 200
         return response.json()
 
     try:
         data = _query_api()
-        if data and 'result' in data and data['result'] and 'table' in data['result'] and 'data' in data['result']['table']:
+        if data and isinstance(data, list) and data: # Check if data is a non-empty list
             planets = []
-            for row in data['result']['table']['data']:
-                name = row[0] if row[0] else 'Unknown'
-                period_str = row[1]
-                period = float(period_str) if period_str and str(period_str).lower() != 'nan' else None
+            # Note: The original parsing logic assumed a specific complex dictionary structure which may change.
+            # Using the simpler format for the TAP service is generally more robust.
+            for row in data:
+                 # Assumes data is a list of lists/dicts where the first two elements are name and period
+                if isinstance(row, dict) and 'pl_name' in row and 'pl_orbper' in row:
+                    name = row['pl_name']
+                    period = row['pl_orbper']
+                elif isinstance(row, list) and len(row) >= 2:
+                    name = row[0]
+                    period = row[1]
+                else:
+                    continue
+
+                period = float(period) if period and str(period).lower() not in ('nan', 'null') else None
                 if period:
                     planets.append((name, period))
             return len(planets) > 0, planets
         return False, []
     except Exception as e:
         st.warning(f"Exoplanet query failed after retries for {tic_id}: {str(e)}. Treating as non-host.")
-        return False, []  # Fallback: Assume no planets to avoid false negatives
+        return False, [] # Fallback: Assume no planets to avoid false negatives
+
+# --------------------------------------
+# FIX FOR UNHASHABLE TYPE ERROR (New Cached Function)
+# --------------------------------------
+@st.cache_data(ttl=3600, show_spinner=False)
+def _download_and_clean_lc(full_tic):
+    """
+    Downloads and cleans the Light Curve data using only the hashable TIC string.
+    Returns the cleaned LightCurve object and metadata.
+    """
+    search_result = search_lightcurve(full_tic)
+    if len(search_result) == 0:
+        return None, None 
+        
+    selected_row = search_result[0]
+    lc = selected_row.download()
+    
+    if lc is None:
+        return None, None
+        
+    lc_clean = clean_lightcurve(lc)
+    
+    # Extract metadata for debug logging outside the cached function
+    mission = selected_row.mission if hasattr(selected_row, 'mission') else 'Unknown'
+    sector = selected_row.sector if hasattr(selected_row, 'sector') else 'Unknown'
+    metadata = f"{mission} Sector {sector}"
+    
+    return lc_clean, metadata
+
 
 def run_analysis(tic_id, debug=False):
     """Run the full analysis for a single TIC ID and return results and figures."""
@@ -140,9 +181,6 @@ def run_analysis(tic_id, debug=False):
         full_tic = get_full_tic(tic_id)
         tic_clean = clean_tic_id(tic_id)
         
-        if debug:
-            st.info(f"🔍 Debug: Cleaned TIC: {tic_clean}")
-        
         # Check for confirmed exoplanet info
         if debug:
             st.info("🔍 Debug: Querying exoplanet archive...")
@@ -151,32 +189,32 @@ def run_analysis(tic_id, debug=False):
         if debug:
             st.info(f"🔍 Debug: Exoplanet host: {is_exoplanet_host}, Planets: {len(planet_info)}")
         
-        # Data Fetch and Cleaning
+        # Data Fetch and Cleaning - **USING CACHED FUNCTION**
         if debug:
-            st.info("🔍 Debug: Fetching light curve data...")
-        sector_data = search_lightcurve(full_tic)
-        if len(sector_data) == 0:
-            return None, "No data found for TIC ID.", {}
-        # Use the first sector instead of second to avoid index errors
-        selected_row = sector_data[0]
-        lc = selected_row.download()
-        if debug:
-            mission = selected_row.mission if hasattr(selected_row, 'mission') else 'Unknown'
-            sector = selected_row.sector if hasattr(selected_row, 'sector') else mission.split(' ') [-1] if 'Sector' in mission else 'Unknown'
-            st.info(f"🔍 Debug: Downloaded LC from {mission} Sector {sector}")
+            st.info("🔍 Debug: Fetching light curve data using cached downloader...")
         
+        lc_clean, metadata = _download_and_clean_lc(full_tic)
+
+        if lc_clean is None:
+            return None, "No data found or download failed for TIC ID.", {}
+            
         if debug:
-            st.info("🔍 Debug: Cleaning light curve...")
-        lc_clean = clean_lightcurve(lc)
+            st.info(f"🔍 Debug: Downloaded and cleaned LC from {metadata}")
+        
         time = lc_clean.time.value
         flux = lc_clean.flux.value
         if debug:
             st.info(f"🔍 Debug: LC cleaned - {len(time)} points")
         
+        # Note: compute_flux_stats now returns 'amp' as a fraction, so all checks should be consistent.
         amp, rms, flux_mean, flux_std = compute_flux_stats(flux)
         rel_std = flux_std / flux_mean
+        
+        # Convert amplitude to percentage for display only (as in your original display format)
+        display_amp = 100 * amp 
+        
         if debug:
-            st.info(f"🔍 Debug: Flux stats computed - Amp: {amp:.2f}%, RMS: {rms:.6f}")
+            st.info(f"🔍 Debug: Flux stats computed - Amp: {display_amp:.2f}%, RMS: {rms:.6f}")
 
         # BLS Analysis
         if debug:
@@ -186,7 +224,7 @@ def run_analysis(tic_id, debug=False):
         bls_result = bls.power(bls_periods, BLS_DURATION)
         bls_best_period = bls_result.period[np.argmax(bls_result.power)]
         bls_max_power = np.max(bls_result.power)
-        bls_variable = classify_variable(bls_max_power, BLS_POWER_THRESHOLD, amp, rms, rel_std)
+        bls_variable = classify_variable(bls_max_power, BLS_POWER_THRESHOLD, amp, rms, rel_std) # uses fractional amp
         if debug:
             st.info(f"🔍 Debug: BLS complete - Best period: {bls_best_period:.5f}, Variable: {bls_variable}")
 
@@ -258,12 +296,12 @@ def run_analysis(tic_id, debug=False):
         if debug:
             st.info("🔍 Debug: Analysis complete - Displaying results")
 
-        # Results dict
+        # Results dict (using display_amp which is a percentage)
         known_planets = ', '.join([name for name, _ in planet_info]) if planet_info else 'None'
         results = {
             'BLS Best Period': f"{bls_best_period:.5f} days",
             'BLS Max Power': f"{bls_max_power:.5f}",
-            'Amplitude': f"{amp:.2f}%",
+            'Amplitude': f"{display_amp:.2f}%",
             'RMS': f"{rms:.6f}",
             'Relative Std Dev': f"{rel_std:.6f}",
             'Confirmed Exoplanet Host': 'Yes' if is_exoplanet_host else 'No',
@@ -327,7 +365,7 @@ if input_mode == "Single TIC ID":
                     for key, fig in figs.items():
                         try:
                             st.pyplot(fig)
-                            plt.close(fig)  # Close to free memory
+                            plt.close(fig) # Close to free memory
                         except Exception as e:
                             st.error(f"Plot '{key}' failed: {e}")
                 else:
@@ -345,7 +383,7 @@ elif input_mode == "Upload CSV":
         for raw_id in raw_ids:
             try:
                 cleaned = clean_tic_id(raw_id)
-                tic_ids.append(f"TIC {cleaned}")  # Store as full for analysis
+                tic_ids.append(f"TIC {cleaned}") # Store as full for analysis
             except ValueError:
                 st.warning(f"Skipping invalid TIC ID: {raw_id}")
         st.sidebar.write(f"Loaded {len(tic_ids)} valid TIC IDs from {len(raw_ids)} entries.")
